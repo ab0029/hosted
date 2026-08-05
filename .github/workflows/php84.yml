@@ -1,0 +1,43 @@
+name: Build Windows PHP 8.4 CLI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    name: Build Windows PHP 8.4
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP (for tools)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.2
+
+      - name: Download static-php-cli
+        run: |
+          Invoke-WebRequest -Uri "https://dl.static-php.dev/v3/spc-bin/nightly/spc-windows-x64.exe" -OutFile "spc.exe"
+          .\spc.exe --version
+          .\spc.exe doctor --auto-fix
+
+      - name: Generate craft.yml
+        run: |
+          @"
+          php-version: 8.4
+          extensions: amqp,apcu,bcmath,bz2,calendar,ctype,curl,dba,dom,ds,exif,ffi,fileinfo,filter,ftp,gd,iconv,igbinary,libxml,mbregex,mbstring,mysqli,mysqlnd,opcache,openssl,pdo,pdo_mysql,pdo_sqlite,pdo_sqlsrv,phar,rar,redis,session,shmop,simdjson,simplexml,soap,sockets,sodium,sqlite3,sqlsrv,ssh2,swow,sysvshm,tokenizer,xlswriter,xml,xmlreader,xmlwriter,yac,yaml,zip,zlib
+          sapi:
+            - cli
+          "@ > craft.yml
+
+      - name: Build PHP CLI via craft
+        run: .\spc.exe craft
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-8.4-windows-cli
+          path: buildroot/bin/php.exe
