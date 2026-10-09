@@ -212,7 +212,9 @@ jobs:
         run: |
           set -euo pipefail
           CLANG="${{ steps.clang.outputs.version }}"
-          T="stage/compiler-rt-${CLANG}.src/compiler-rt"
+          # Absolute: the compiles below run from a per-triple object directory, and zig resolves
+          # relative source/include paths against that cwd (leading to CacheCheckFailed).
+          T="$(realpath "stage/compiler-rt-${CLANG}.src/compiler-rt")"
           OUT="$RUNNER_TEMP/obj"
           rm -rf "$OUT"
           mapfile -t FILES < <(find "$T/lib/profile" -maxdepth 1 \( -name '*.c' -o -name '*.cpp' \) \
