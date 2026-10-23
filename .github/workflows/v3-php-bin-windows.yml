@@ -122,6 +122,33 @@ jobs:
           ls dist
           echo ("PHPVER=" + $PHPVER) >> $env:GITHUB_ENV
 
+      - name: "Generate SHA-256 checksums"
+        shell: pwsh
+        run: |
+          # Every matrix job uploads into the same OSS prefix, so one shared checksum file would be
+          # overwritten by whichever job finishes last. Publish a `<archive>.sha256` sidecar next to
+          # each archive instead, in the `<hash>  <name>` format `sha256sum -c` understands.
+          $archives = @(Get-ChildItem -Path dist -Filter *.zip)
+          if ($archives.Count -eq 0) { throw "No archives found in dist" }
+
+          foreach ($archive in $archives) {
+            $hash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLower()
+            # ASCII plus LF endings, so the sidecar also verifies on Linux and macOS.
+            [System.IO.File]::WriteAllText(
+              "$($archive.FullName).sha256",
+              "$hash  $($archive.Name)`n",
+              [System.Text.Encoding]::ASCII
+            )
+            Get-Content -LiteralPath "$($archive.FullName).sha256"
+          }
+
+          # Sanity-check that every sidecar parses and matches the archive it was written for.
+          foreach ($checksum in Get-ChildItem -Path dist -Filter *.sha256) {
+            $expected, $name = (Get-Content -LiteralPath $checksum.FullName -Raw).Trim() -split '\s+', 2
+            $actual = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) { throw "Checksum verification failed for $name" }
+          }
+
       - name: "Add README for ${{ matrix.combination }}"
         if: ${{ matrix.php-version == '8.4' }}
         shell: bash

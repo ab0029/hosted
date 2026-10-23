@@ -206,6 +206,30 @@ jobs:
           echo "PHPVER=$PHPVER" >> "$GITHUB_ENV"
           ls -la dist
 
+      - name: "Generate SHA-256 checksums"
+        shell: bash
+        run: |
+          # Every matrix job uploads into the same OSS prefix, so one shared checksum file would be
+          # overwritten by whichever job finishes last. Publish a `<archive>.sha256` sidecar next to
+          # each archive instead, in the `<hash>  <name>` format `sha256sum -c` understands.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+            verify_sha256() { sha256sum -c --strict "$@"; }
+          else
+            sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+            verify_sha256() { shasum -a 256 -c "$@"; }
+          fi
+
+          for archive in *.tar.gz; do
+            [ -e "$archive" ] || continue
+            printf '%s  %s\n' "$(sha256_of "$archive")" "$archive" > "$archive.sha256"
+            cat "$archive.sha256"
+          done
+
+          # Sanity-check that every sidecar parses and matches the archive it was written for.
+          verify_sha256 ./*.sha256
+
       - name: "Add build metadata"
         if: ${{ matrix.php-version == '8.4' && (matrix.runner == 'ubuntu-latest' || matrix.runner == 'ubuntu-22.04') }}
         shell: bash
