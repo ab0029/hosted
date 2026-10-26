@@ -1,0 +1,8 @@
+{
+  "_comment": "Maps the clang version reported by `zig cc --version` (used as an opaque key by SPC) to the LLVM release tag the compiler-rt sources are cut from. Consumed by .github/workflows/compiler-rt-src.yml; entries are only needed when the clang version has no matching LLVM release tag of its own.",
+  "0.17.0": {
+    "clang": "22.1.8",
+    "llvm": "llvmorg-22.1.0",
+    "note": "zig 0.17.0 reports clang 22.1.8, but LLVM publishes the 22.1 series as 22.1.0 only"
+  }
+}

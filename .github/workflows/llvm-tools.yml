@@ -1,0 +1,148 @@
+name: "Build llvm-tools"
+
+# Builds llvm-objcopy, llvm-strip and llvm-profdata with StaticPHP itself (`spc build:libs llvm-tools`)
+# and publishes them for SPC's llvm-tools binary downloader (src/Package/Artifact/llvm_tools.php):
+#
+#   https://dl.static-php.dev/v3/deps/llvm-tools/llvm-tools-<arch>-linux-musl-<clang-version>.txz
+#   https://dl.static-php.dev/v3/deps/llvm-tools/llvm-tools-<arch>-linux-musl-<clang-version>.txz.sha256
+#
+# <arch> is the architecture of the build host, because the tools run there whatever SPC_TARGET is.
+# <clang-version> is the clang bundled with zig, the key SPC looks the archive up by. SPC's default
+# Linux target (<arch>-linux-musl with the zig toolchain) makes the tools static, so one archive
+# serves every distro. It holds a single top-level directory with bin/<tool>, LICENSE.TXT and
+# licenses/; SPC extracts it with --strip-components=1 into {pkg_root_path}/llvm-tools.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spc_ref:
+        description: "static-php-cli ref to build with"
+        required: false
+        default: "v3"
+      force:
+        description: "Rebuild and re-upload even if the archive is already published"
+        type: boolean
+        default: false
+  schedule:
+    # Weekly, an hour after compiler-rt-src.yml. Nothing is built unless zig moved to a new clang.
+    - cron: "0 4 * * 1"
+
+env:
+  GITHUB_TOKEN: ${{ secrets.S_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+  SPC_USE_SUDO: "yes"
+  OSS_BASE: "https://dl.static-php.dev/v3/deps/llvm-tools"
+
+jobs:
+  build:
+    name: "Build llvm-tools (${{ matrix.arch }})"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: "Checkout static-php-cli"
+        uses: actions/checkout@v4
+        with:
+          repository: crazywhalecc/static-php-cli
+          ref: ${{ inputs.spc_ref || 'v3' }}
+
+      - name: "Setup PHP"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+          tools: composer
+          extensions: curl, openssl, mbstring
+          ini-values: memory_limit=-1
+
+      - name: "Install dependencies"
+        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
+
+      - name: "Doctor"
+        run: bin/spc doctor --auto-fix
+
+      - name: "Check whether this version is already published"
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # Asked from SPC itself, so the name always matches what its downloader looks for.
+          CLANG=$(bin/spc check-update llvm-tools --bare --json --no-motd | jq -r '.["llvm-tools"].new // empty')
+          if [ -z "$CLANG" ]; then
+            echo "::error::Cannot determine the clang version of zig"
+            exit 1
+          fi
+          NAME="llvm-tools-${{ matrix.arch }}-linux-musl-${CLANG}"
+          {
+            echo "clang=$CLANG"
+            echo "name=$NAME"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 200 = published, 404 = missing. Anything else must not count as missing: a rebuild is not
+          # bit-identical and would replace an archive that consumers have already verified.
+          status() { curl -sIL -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors "$1" || true; }
+          ARCHIVE=$(status "$OSS_BASE/$NAME.txz")
+          CHECKSUM=$(status "$OSS_BASE/$NAME.txz.sha256")
+          if [ "$ARCHIVE" = 200 ] && [ "$CHECKSUM" = 200 ]; then
+            echo "already published: $OSS_BASE/$NAME.txz"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [ "$ARCHIVE" = 404 ] || [ "$CHECKSUM" = 404 ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Cannot tell whether $NAME.txz is published (HTTP $ARCHIVE / $CHECKSUM)"
+            exit 1
+          fi
+
+      - name: "Build llvm-tools"
+        if: steps.check.outputs.build == 'true'
+        run: bin/spc build:libs llvm-tools --dl-retry=5 --debug
+
+      - name: "Package"
+        if: steps.check.outputs.build == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          CLANG: ${{ steps.check.outputs.clang }}
+          NAME: ${{ steps.check.outputs.name }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage/$NAME"
+          mkdir -p "$STAGE/licenses" dist
+          cp -a "pkgroot/$ARCH-linux/llvm-tools/bin" "$STAGE/"
+          cp source/llvm-tools/llvm/LICENSE.TXT "$STAGE/"
+          # zlib and musl are linked into the tools statically.
+          cp source/zlib/LICENSE "$STAGE/licenses/zlib.txt"
+          cp "pkgroot/$ARCH-linux/zig/lib/libc/musl/COPYRIGHT" "$STAGE/licenses/musl.txt"
+          for TOOL in llvm-objcopy llvm-strip llvm-profdata; do
+            file "$STAGE/bin/$TOOL" | grep -q 'statically linked' || { echo "::error::$TOOL is not static"; exit 1; }
+            "$STAGE/bin/$TOOL" --version | grep -q "LLVM version $CLANG" || { echo "::error::$TOOL is not LLVM $CLANG"; exit 1; }
+          done
+          # A large dictionary lets xz store llvm-strip, a copy of llvm-objcopy, almost for free.
+          XZ_OPT='-9 -T1' tar -C "$RUNNER_TEMP/stage" --owner=0 --group=0 --numeric-owner -cJf "dist/$NAME.txz" "$NAME"
+          (cd dist && sha256sum "$NAME.txz" > "$NAME.txz.sha256")
+          tar -tvJf "dist/$NAME.txz"
+          cat "dist/$NAME.txz.sha256"
+
+      - name: "Deploy to OSS"
+        if: steps.check.outputs.build == 'true'
+        uses: static-php/upload-s3-action@v1.0.0
+        with:
+          aws_key_id: ${{ secrets.AWS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_bucket: ${{ secrets.AWS_BUCKET }}
+          source_dir: "dist/"
+          destination_dir: "v3/deps/llvm-tools/"
+          endpoint: ${{ secrets.AWS_ENDPOINT }}
+
+      - name: "Upload logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc-logs-llvm-tools-${{ matrix.arch }}
+          path: log/*.log
+          if-no-files-found: ignore

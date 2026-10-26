@@ -1,0 +1,292 @@
+name: "Build compiler-rt source archive"
+
+# SPC compiles the compiler-rt pieces zig does not ship (profile runtime, cpu_model,
+# crtbegin/crtend) from LLVM sources. Since LLVM 22 there is no per-subproject source
+# tarball anymore, so SPC would have to download the 150+MB llvm-project tarball just for
+# a handful of files. This workflow trims compiler-rt down to what SPC compiles
+# (~1.3MB unpacked, ~140KB compressed) and publishes it as
+#
+#   https://dl.static-php.dev/v3/deps/compiler-rt/compiler-rt-<clang-version>.src.tar.xz
+#
+# The clang version reported by `zig cc --version` is used as an opaque key: it changes
+# whenever zig bumps LLVM, and LLVM release tags do not always match it (zig 0.17.0 reports
+# 22.1.8 while LLVM publishes the 22.1 series as 22.1.0). The mapping from that key to an
+# LLVM release tag lives in .github/llvm-map.json and is auto-detected as a fallback.
+#
+# Archive layout: exactly one top-level directory containing compiler-rt/. SPC extracts
+# with --strip-components=1 and uses source-root=compiler-rt, which matches both this
+# archive and the upstream llvm-project tarball fallback.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zig_version:
+        description: "zig version to cut compiler-rt for (e.g. 0.17.0); empty or 'latest' = latest stable"
+        required: false
+        default: "latest"
+      force:
+        description: "Rebuild and re-upload even if the archive already exists"
+        type: boolean
+        default: false
+  schedule:
+    # Weekly is enough: the content only changes when zig ships a new LLVM version, and the
+    # run exits early (a few seconds) when the archive for the current zig already exists.
+    - cron: "0 3 * * 1"
+
+env:
+  OSS_BASE: "https://dl.static-php.dev/v3/deps/compiler-rt"
+  DEST_DIR: "v3/deps/compiler-rt/"
+
+jobs:
+  build:
+    name: "Trim compiler-rt from LLVM sources"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Resolve zig version"
+        id: zig
+        run: |
+          set -euo pipefail
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          REQUESTED="${{ inputs.zig_version }}"
+          if [ -z "$REQUESTED" ] || [ "$REQUESTED" = "latest" ]; then
+            VERSION=$(echo "$INDEX" | jq -r 'keys_unsorted | map(select(. != "master")) | first')
+          else
+            VERSION="$REQUESTED"
+          fi
+          TARBALL=$(echo "$INDEX" | jq -r --arg v "$VERSION" '.[$v]["x86_64-linux"].tarball // empty')
+          if [ -z "$TARBALL" ]; then
+            echo "::error::Cannot resolve zig $VERSION for x86_64-linux"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "zig $VERSION -> $TARBALL"
+
+      - name: "Install zig"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zig"
+          curl -fsSL "${{ steps.zig.outputs.tarball }}" -o "$RUNNER_TEMP/zig.tar.xz"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: "Detect clang version"
+        id: clang
+        run: |
+          set -euo pipefail
+          CLANG=$(zig cc --version | head -n1 | sed -n 's/^clang version \([0-9][0-9.]*\).*/\1/p')
+          if [ -z "$CLANG" ]; then
+            echo "::error::Could not parse the clang version from 'zig cc --version'"
+            zig cc --version
+            exit 1
+          fi
+          echo "version=$CLANG" >> "$GITHUB_OUTPUT"
+          echo "clang $CLANG"
+
+      - name: "Check whether the archive already exists"
+        id: existing
+        run: |
+          set -euo pipefail
+          URL="$OSS_BASE/compiler-rt-${{ steps.clang.outputs.version }}.src.tar.xz"
+          if [ "${{ inputs.force }}" != "true" ] && curl -sfI "$URL" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "already published: $URL"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Resolve LLVM release tag"
+        if: steps.existing.outputs.exists == 'false'
+        id: llvm
+        run: |
+          set -euo pipefail
+          CLANG="${{ steps.clang.outputs.version }}"
+          ZIG="${{ steps.zig.outputs.version }}"
+          TAG=""
+          SOURCE="map"
+          if [ -f .github/llvm-map.json ]; then
+            TAG=$(jq -r --arg z "$ZIG" '.[$z].llvm // empty' .github/llvm-map.json 2>/dev/null || true)
+          fi
+          if [ -z "$TAG" ]; then
+            SOURCE="auto-detected"
+            MM=$(echo "$CLANG" | cut -d. -f1,2)
+            RELEASES=$(curl -fsSL "https://api.github.com/repos/llvm/llvm-project/releases?per_page=100")
+            TAG=$(echo "$RELEASES" | jq -r '.[].tag_name' | grep -E "^llvmorg-${MM}\.[0-9]+$" | sort -V | tail -n1 || true)
+            if [ -z "$TAG" ]; then
+              TAG=$(echo "$RELEASES" | jq -r '.[].tag_name' | grep -E "^llvmorg-${CLANG}$" | head -n1 || true)
+            fi
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::No LLVM release found for clang $CLANG (zig $ZIG). Add an entry to .github/llvm-map.json."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "llvm $TAG ($SOURCE)"
+
+      - name: "Download LLVM source"
+        if: steps.existing.outputs.exists == 'false'
+        id: source
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.llvm.outputs.tag }}"
+          VERSION="${TAG#llvmorg-}"
+          BASE="https://github.com/llvm/llvm-project/releases/download/${TAG}"
+          SMALL="compiler-rt-${VERSION}.src.tar.xz"
+          BIG="llvm-project-${VERSION}.src.tar.xz"
+          if curl -sfI "${BASE}/${SMALL}" >/dev/null; then
+            FILE="$SMALL"; LAYOUT="subproject"
+          else
+            FILE="$BIG"; LAYOUT="mono"
+          fi
+          echo "downloading $FILE ($LAYOUT layout)"
+          curl -fsSL --retry 3 --retry-delay 5 -o src.tar.xz "${BASE}/${FILE}"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "layout=$LAYOUT" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum src.tar.xz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -la src.tar.xz
+
+      - name: "Extract and trim compiler-rt"
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          LAYOUT="${{ steps.source.outputs.layout }}"
+          CLANG="${{ steps.clang.outputs.version }}"
+          rm -rf work work-crt stage dist
+          mkdir -p work
+          if [ "$LAYOUT" = "subproject" ]; then
+            # compiler-rt-<version>.src/{lib,include,...}
+            tar -xJf src.tar.xz -C work --wildcards 'compiler-rt-*.src'
+            mv work/compiler-rt-*.src work-crt
+          else
+            # llvm-project-<version>.src/compiler-rt/... - only this subtree, not the other 2.4GB
+            tar -xJf src.tar.xz -C work --wildcards 'llvm-project-*.src/compiler-rt'
+            mv work/llvm-project-*.src/compiler-rt work-crt
+          fi
+          test -d work-crt/lib/profile
+          test -f work-crt/LICENSE.TXT
+
+          # Trim to what SPC's Package\Target\llvm_compiler_rt::build() compiles.
+          TOP="stage/compiler-rt-${CLANG}.src"
+          mkdir -p "$TOP/compiler-rt/lib/builtins"
+          cp -a work-crt/lib/profile "$TOP/compiler-rt/lib/"
+          if [ -d work-crt/lib/builtins/cpu_model ]; then
+            cp -a work-crt/lib/builtins/cpu_model "$TOP/compiler-rt/lib/builtins/"
+          fi
+          if [ -f work-crt/lib/builtins/cpu_model.c ]; then
+            cp -a work-crt/lib/builtins/cpu_model.c "$TOP/compiler-rt/lib/builtins/"
+          fi
+          cp -a work-crt/lib/builtins/crtbegin.c work-crt/lib/builtins/crtend.c "$TOP/compiler-rt/lib/builtins/"
+          cp -a work-crt/include "$TOP/compiler-rt/"
+          cp -a work-crt/LICENSE.TXT "$TOP/compiler-rt/"
+
+          # Provenance for SBOM consumers (component name, upstream tag, upstream archive hash).
+          jq -n \
+            --arg component "compiler-rt" \
+            --arg version "$CLANG" \
+            --arg license "Apache-2.0 WITH LLVM-exception" \
+            --arg upstream "https://github.com/llvm/llvm-project/releases/tag/${{ steps.llvm.outputs.tag }}" \
+            --arg archive "${{ steps.source.outputs.file }}" \
+            --arg sha "${{ steps.source.outputs.sha256 }}" \
+            --arg zig "${{ steps.zig.outputs.version }}" \
+            --arg generated "$(date -u +%FT%TZ)" \
+            '{
+              component: $component,
+              version: $version,
+              "spdx-license": $license,
+              upstream: $upstream,
+              "upstream-archive": $archive,
+              "upstream-archive-sha256": $sha,
+              "trimmed-paths": ["lib/profile", "lib/builtins/cpu_model", "lib/builtins/crtbegin.c", "lib/builtins/crtend.c", "include"],
+              "zig-version": $zig,
+              "generated-at": $generated
+            }' > "$TOP/compiler-rt/PROVENANCE.json"
+          cat "$TOP/compiler-rt/PROVENANCE.json"
+          echo "trimmed tree: $(du -sh "$TOP" | cut -f1), $(find "$TOP" -type f | wc -l) files"
+
+      - name: "Smoke-compile the trimmed sources"
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          CLANG="${{ steps.clang.outputs.version }}"
+          # Absolute: the compiles below run from a per-triple object directory, and zig resolves
+          # relative source/include paths against that cwd (leading to CacheCheckFailed).
+          T="$(realpath "stage/compiler-rt-${CLANG}.src/compiler-rt")"
+          OUT="$RUNNER_TEMP/obj"
+          rm -rf "$OUT"
+          mapfile -t FILES < <(find "$T/lib/profile" -maxdepth 1 \( -name '*.c' -o -name '*.cpp' \) \
+            ! -name '*PlatformAIX*' ! -name '*PlatformDarwin*' ! -name '*PlatformFuchsia*' \
+            ! -name '*PlatformOther*' ! -name '*PlatformWindows*' ! -name '*WindowsMMap*' | sort)
+          echo "profile sources: ${#FILES[@]}"
+          for TRIPLE in x86_64-linux-musl aarch64-linux-musl; do
+            D="$OUT/$TRIPLE"
+            mkdir -p "$D"
+            (cd "$D" && zig cc -target "$TRIPLE" -c -O2 -fPIC -fvisibility=hidden -I"$T/include" \
+              -DCOMPILER_RT_HAS_ATOMICS=1 -DCOMPILER_RT_HAS_FCNTL_LCK=1 -DCOMPILER_RT_HAS_UNAME=1 "${FILES[@]}")
+            (cd "$D" && zig ar rcs libclang_rt.profile.a ./*.o)
+            zig cc -target "$TRIPLE" -c -O2 -fPIC -fvisibility=hidden -DCRT_HAS_INITFINI_ARRAY -o "$D/crtbegin.o" "$T/lib/builtins/crtbegin.c"
+            zig cc -target "$TRIPLE" -c -O2 -fPIC -fvisibility=hidden -DCRT_HAS_INITFINI_ARRAY -o "$D/crtend.o" "$T/lib/builtins/crtend.c"
+            if [ -d "$T/lib/builtins/cpu_model" ]; then
+              case "$TRIPLE" in
+                aarch64*) CPU="$T/lib/builtins/cpu_model/aarch64.c" ;;
+                *)        CPU="$T/lib/builtins/cpu_model/x86.c" ;;
+              esac
+              zig cc -target "$TRIPLE" -c -O2 -fPIC -I"$T/lib/builtins" -I"$T/lib/builtins/cpu_model" -o "$D/cpu_model.o" "$CPU"
+            else
+              zig cc -target "$TRIPLE" -c -O2 -fPIC -I"$T/lib/builtins" -o "$D/cpu_model.o" "$T/lib/builtins/cpu_model.c"
+            fi
+            test -s "$D/libclang_rt.profile.a"
+            test -s "$D/crtbegin.o"
+            test -s "$D/crtend.o"
+            test -s "$D/cpu_model.o"
+            echo "$TRIPLE ok: profile $(stat -c%s "$D/libclang_rt.profile.a") B, crt $(stat -c%s "$D/crtbegin.o")/$(stat -c%s "$D/crtend.o") B, cpu_model $(stat -c%s "$D/cpu_model.o") B"
+          done
+
+      - name: "Package and verify the archive"
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          CLANG="${{ steps.clang.outputs.version }}"
+          mkdir -p dist
+          tar -cJf "dist/compiler-rt-${CLANG}.src.tar.xz" -C stage "compiler-rt-${CLANG}.src"
+          (cd dist && sha256sum "compiler-rt-${CLANG}.src.tar.xz" > "compiler-rt-${CLANG}.src.tar.xz.sha256")
+          tar -tJf "dist/compiler-rt-${CLANG}.src.tar.xz" > "$RUNNER_TEMP/listing.txt"
+          # exactly the layout SPC expects: <top>/compiler-rt/{lib,include,LICENSE.TXT}
+          grep -qx "compiler-rt-${CLANG}.src/compiler-rt/lib/profile/InstrProfiling.c" "$RUNNER_TEMP/listing.txt"
+          grep -qx "compiler-rt-${CLANG}.src/compiler-rt/lib/builtins/crtbegin.c" "$RUNNER_TEMP/listing.txt"
+          grep -qx "compiler-rt-${CLANG}.src/compiler-rt/LICENSE.TXT" "$RUNNER_TEMP/listing.txt"
+          grep -qx "compiler-rt-${CLANG}.src/compiler-rt/PROVENANCE.json" "$RUNNER_TEMP/listing.txt"
+          if grep -q "lib/builtins/absvdi2.c" "$RUNNER_TEMP/listing.txt"; then
+            echo "::error::trimming failed: the archive still contains unrelated compiler-rt builtins"
+            exit 1
+          fi
+          ls -la dist/
+          echo "archive verified: $(wc -l < "$RUNNER_TEMP/listing.txt") entries, $(stat -c%s "dist/compiler-rt-${CLANG}.src.tar.xz") bytes"
+
+      - name: "Deploy to OSS"
+        if: steps.existing.outputs.exists == 'false'
+        uses: static-php/upload-s3-action@v1.0.0
+        with:
+          aws_key_id: ${{ secrets.AWS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_bucket: ${{ secrets.AWS_BUCKET }}
+          source_dir: "dist/"
+          destination_dir: ${{ env.DEST_DIR }}
+          endpoint: ${{ secrets.AWS_ENDPOINT }}
+
+      - name: "Summary"
+        run: |
+          {
+            echo "### compiler-rt source archive"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| zig | ${{ steps.zig.outputs.version }} |"
+            echo "| clang | ${{ steps.clang.outputs.version }} |"
+            echo "| llvm tag | ${{ steps.llvm.outputs.tag }} (${{ steps.llvm.outputs.source }}) |"
+            echo "| already published | ${{ steps.existing.outputs.exists }} |"
+            echo "| url | $OSS_BASE/compiler-rt-${{ steps.clang.outputs.version }}.src.tar.xz |"
+          } >> "$GITHUB_STEP_SUMMARY"

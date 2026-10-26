@@ -79,12 +79,12 @@ jobs:
             ubuntu-22.04)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=x86_64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             ubuntu-22.04-arm)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=aarch64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             macos-15-intel)
               echo "OS=macos" >> "$GITHUB_OUTPUT"
@@ -147,18 +147,38 @@ jobs:
       - name: "Build PHP"
         shell: bash
         run: |
-          ${{ steps.process-env.outputs.CMD }} build \
-            --build-cli \
-            --build-micro \
-            --build-fpm \
-            "${{ steps.process-env.outputs.EXTENSIONS }}" \
-            --debug \
-            ${{ steps.process-env.outputs.UPX }} \
-            ${{ steps.process-env.outputs.SUGGEST }} \
-            --dl-with-php="${{ matrix.php-version }}" \
-            --dl-retry=5 \
-            --dl-prefer-binary \
-            --dl-ignore-cache=php-src
+          # spc exit code 75 = DOWNLOAD_ERROR (network / remote resource error).
+          # Retry up to 3 times on download errors only; build errors (72) fail immediately.
+          # Note: `if` is used so that a non-zero exit does not trip the default `set -e`.
+          for attempt in 1 2 3; do
+            echo "Build attempt ${attempt}/3"
+            if ${{ steps.process-env.outputs.CMD }} build \
+              --build-cli \
+              --build-micro \
+              --build-fpm \
+              "${{ steps.process-env.outputs.EXTENSIONS }}" \
+              --debug \
+              ${{ steps.process-env.outputs.UPX }} \
+              ${{ steps.process-env.outputs.SUGGEST }} \
+              --dl-with-php="${{ matrix.php-version }}" \
+              --dl-retry=5 \
+              --dl-prefer-binary \
+              --dl-ignore-cache=php-src; then
+              exit 0
+            else
+              code=$?
+            fi
+            echo "::warning::Build attempt ${attempt}/3 failed with exit code ${code}"
+            if [ "$code" -ne 75 ]; then
+              # Not a download error, do not retry
+              exit "$code"
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Download error detected (exit code 75), retrying in 30s..."
+              sleep 30
+            fi
+          done
+          exit 75
 
       - name: "Pack PHP"
         shell: bash
@@ -185,6 +205,30 @@ jobs:
 
           echo "PHPVER=$PHPVER" >> "$GITHUB_ENV"
           ls -la dist
+
+      - name: "Generate SHA-256 checksums"
+        shell: bash
+        run: |
+          # Every matrix job uploads into the same OSS prefix, so one shared checksum file would be
+          # overwritten by whichever job finishes last. Publish a `<archive>.sha256` sidecar next to
+          # each archive instead, in the `<hash>  <name>` format `sha256sum -c` understands.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+            verify_sha256() { sha256sum -c --strict "$@"; }
+          else
+            sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+            verify_sha256() { shasum -a 256 -c "$@"; }
+          fi
+
+          for archive in *.tar.gz; do
+            [ -e "$archive" ] || continue
+            printf '%s  %s\n' "$(sha256_of "$archive")" "$archive" > "$archive.sha256"
+            cat "$archive.sha256"
+          done
+
+          # Sanity-check that every sidecar parses and matches the archive it was written for.
+          verify_sha256 ./*.sha256
 
       - name: "Add build metadata"
         if: ${{ matrix.php-version == '8.4' && (matrix.runner == 'ubuntu-latest' || matrix.runner == 'ubuntu-22.04') }}
